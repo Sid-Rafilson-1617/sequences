@@ -1,16 +1,29 @@
 
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize_scalar
+import os
+from tqdm import tqdm
 from scipy.special import logsumexp
 from scipy.stats import poisson
-import numpy as np
 
-class PoissonHMM:
+
+
+
+
+class custom_PoissonHMM:
     
-    def __init__(self, A, B, pi):
+    def __init__(self, A, B, pi, eps=1e-12):
         '''
         Initialize the HMM with the transition matrix (A), emission probability matrix (B) and prior probability distribution (pi)
         '''
+        self.eps = eps
+
         self.A = np.array(A)
-        self.log_A = np.log(A)
+        self.log_A = np.log(A + self.eps)
+        self.log_A[self.A == 0] = -np.inf # setting any zero entries in A to -inf in log-space
 
         self.B = np.array(B)
 
@@ -23,8 +36,6 @@ class PoissonHMM:
         self.T = 0
 
         self.log_emissions = None
-
-        self.eps = 1e-12
 
 
     def generate_samples(self, Nsamples):
@@ -161,23 +172,35 @@ class PoissonHMM:
             - log_likelihood
         )
 
+        # normalize
+        log_xi -= logsumexp(
+            log_xi,
+            axis=(1,2),
+            keepdims=True
+        )
+
         return log_xi # (T-1) x N x N
 
 
     def compute_log_gamma(self, log_alpha, log_beta):
         
-        log_likelihood = logsumexp(log_alpha[-1]) # scalar
 
         log_gamma = (
             log_alpha       # T x N
             + log_beta      # T x N
-            - log_likelihood
+        )
+
+        # Normalize
+        log_gamma -= logsumexp(
+            log_gamma,
+            axis=1,
+            keepdims=True
         )
 
         return log_gamma # T x N
     
 
-    def forward_backward(self, transition_update_mask = None):
+    def forward_backward(self, transition_update_mask = None, save_dir = None, use_cloned_emissions = False):
         '''using the forward backward algorithm to update the transition matrix (A) and the emissions matrix (B) using the forward and backwards probabilities'''
 
         #---------------------------Expectation----------------------------------
@@ -190,91 +213,122 @@ class PoissonHMM:
         # compuite xi
         log_xi = self.compute_log_xi(self.log_alpha, self.log_beta) # (T-1) x N x N
 
+        if transition_update_mask is not None:
+            log_xi = np.where(
+                transition_update_mask,
+                log_xi,
+                -np.inf
+            )
+
         # compute gamma
         log_gamma = self.compute_log_gamma(self.log_alpha, self.log_beta) # T x N
+
+        if save_dir is not None:
+            # plot the xi values as a heatmap
+            avg_log_xi = logsumexp(log_xi, axis=0) - np.log(log_xi.shape[0]) # N x N
+            avg_xi = np.exp(avg_log_xi)
+            plt.figure(figsize=(22, 20))
+            sns.heatmap(avg_xi, annot=True, fmt=".1e", cmap="Greys" )
+            plt.title("Average Xi Values (Transition Probabilities)")
+            plt.xlabel("Next State")
+            plt.ylabel("Current State")
+            plt.savefig(os.path.join(save_dir, "average_xi_heatmap.png"))
+            plt.close()
 
 
 
         #---------------------------Maximization---------------------------------
 
         # numerator
-        log_sum_xi_over_time = logsumexp(log_xi, axis = 0)      # N x N
+        log_sum_xi = logsumexp(log_xi, axis = 0)      # N x N
 
         # denominator
-        log_sum_xi_over_states_and_time = logsumexp(
-            log_sum_xi_over_time,
-            axis = 1
-        )     # N
+        log_row_norm = logsumexp(log_sum_xi, axis=1)  # N
 
         log_A_hat = (
-            log_sum_xi_over_time[:, :]  # N x N
-            - log_sum_xi_over_states_and_time[:, None]
+            log_sum_xi  # N x N
+            - log_row_norm[:, None] # N x 1
         )
+
 
         A_hat = np.exp(log_A_hat)
 
-        
-        # Optionally freeze some elements of the transition matrix
+        # explicitly set any zero entries in the transition matrix to zero to avoid numerical issues with very small probabilities
         if transition_update_mask is not None:
-
-            # True = update
-            # False = freeze
-
-            A_new = self.A.copy()
-
-            for i in range(self.N):
-
-                update_mask = transition_update_mask[i]
-                freeze_mask = ~update_mask
-
-                # keep frozen entries
-                frozen_mass = self.A[i, freeze_mask].sum()
-
-                remaining_mass = 1.0 - frozen_mass
-
-                if remaining_mass < 0:
-                    raise ValueError("Frozen probabilities exceed 1.")
-
-                if update_mask.sum() > 0:
-
-                    # proposed updated values
-                    updated_vals = A_hat[i, update_mask]
-
-                    # renormalize only the updated entries
-                    updated_vals = (
-                        updated_vals
-                        / updated_vals.sum()
-                        * remaining_mass
-                    )
-
-                    A_new[i, update_mask] = updated_vals
-
-            A_hat = A_new
+            A_hat = np.where(
+                transition_update_mask,
+                A_hat,
+                0.0
+            )
 
 
         gamma = np.exp(log_gamma)
-        B_hat = (
-            gamma.T @ self.obs
-            / gamma.sum(axis=0)[:, None]
-        ) # N x D
+
+        if use_cloned_emissions:\
+        
+            nSequenceStates = (self.N - 1) // 2
+            B_hat = np.zeros_like(self.B)
+            mu_hat = np.zeros((nSequenceStates, self.B.shape[1]))
+
+            # solving for the clone emissions states
+            for i in range(nSequenceStates):
+                w = gamma[:, i + 1] + gamma[:, nSequenceStates + i + 1]
+
+                mu_hat[i] = (
+                    w[:, None] * self.obs
+                ).sum(axis=0) / w.sum()
+
+                B_hat[i + 1] = mu_hat[i]
+                B_hat[nSequenceStates + i + 1] = mu_hat[i]
+
+
+            # estimating the base state
+            B_hat[0] = (
+                gamma[:, 0][:, None] * self.obs
+            ).sum(axis=0) / gamma[:, 0].sum()
+
+                
+        else:
+            B_hat = (
+                gamma.T @ self.obs
+                / gamma.sum(axis=0)[:, None]
+            ) # N x D
 
             
         return A_hat, B_hat
     
 
-    def fit_em(self, Niters):
+    def fit_em(self, Niters, use_cloned_emissions = False, transition_update_mask = None, save_dir = None):
         '''fit the transition and emissions matrices using expectation maximization'''
 
         llhs = np.zeros(Niters + 1)
         llhs[0] = logsumexp(self.forward_probability()[-1])
-        for iter in range(Niters):
+        for iter in tqdm(range(Niters)):
+
+            if save_dir is not None:
+                current_save_dir = os.path.join(save_dir, f"iteration_{iter}")
+                os.makedirs(current_save_dir, exist_ok=True)
+            else:
+                current_save_dir = None
+
 
             # run the forward backwards pass
-            A_hat, B_hat = self.forward_backward()
+            A_hat, B_hat = self.forward_backward(transition_update_mask = transition_update_mask, save_dir = current_save_dir, use_cloned_emissions = use_cloned_emissions)
 
-            # update the matrices
+            # update the transition matrix
             self.A = A_hat
-            self.log_A = np.log(self.A + self.eps)
+            if transition_update_mask is not None:
+                self.log_A = np.where(
+                    transition_update_mask,
+                    np.log(self.A + self.eps),
+                    -np.inf
+                )
+                self.A[~transition_update_mask] = 0.0
+
+            else:
+                self.log_A = np.log(self.A + self.eps)
+
+            # update the emissions matrix
             self.B = B_hat
 
             # recompute the emissions
