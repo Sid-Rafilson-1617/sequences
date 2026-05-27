@@ -342,3 +342,50 @@ class custom_PoissonHMM:
         return llhs
 
 
+
+def calculate_cloned_transition_matrix(alpha, sequenceLength, nSequences, verbose=False, transition_epsilon=1e-8):
+
+    '''calculate the transition matrix for the cloned HMM given the free parameters (alpha, beta, gamma)'''
+
+    # the total number of states is the number of sequences times the sequence length and we add one for the non-sequence state
+    nStates = sequenceLength * nSequences + 1
+
+    gamma = (1 - alpha) / (2 * sequenceLength * nSequences) # this is the probability of transitioning into or out of any of the sequence states
+    beta = 1 - gamma # this is the probability of transitioning between states in the sequence
+    if verbose:
+        print(f"alpha: {alpha}, beta: {beta}, gamma: {gamma}")
+
+    # initialize the transition matrix with zeros and then fill in the appropriate entries
+    P = np.zeros((1 + 2 * sequenceLength * nSequences, 1 + 2 * sequenceLength * nSequences))
+    P[0, 0] = alpha
+
+    # define the transition probabilities into the sequences (can transition into any part of the sequence with equal probability)
+    P[0, 1:] = gamma
+
+    # define the transition probabilities out of the sequences (can transition out of any part of the sequence with equal probability)
+    P[1:, 0] = gamma
+
+    # define the transition probabilities through the sequences
+    start = None
+    for i in range(nSequences):
+        start = 1 if start is None else end + 1
+        end = start + 2 * sequenceLength - 1
+
+        for idx, j in enumerate(range(start, end + 1)):
+
+            # set the beta values for the forward sequence
+            if idx < sequenceLength - 1:
+                P[j, j + 1] = beta
+
+            # set the beta values for the reverse sequence (these are the cloned states that have the same emission probabilities as the forward sequence states)
+            elif idx > sequenceLength:
+                P[j, j - 1] = beta
+            else:
+                P[j, 0] = 1
+
+    # Tiny smoothing avoids exact zeros that can make EM objective report -inf via log(0).
+    if transition_epsilon is not None and transition_epsilon > 0:
+        P = P + transition_epsilon
+        P = P / P.sum(axis=1, keepdims=True)
+
+    return P
