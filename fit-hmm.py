@@ -144,3 +144,9 @@ def fit_hmm(N: int, emissions: np.ndarray, save_dir: str, Niters: int = 40, nSta
     plt.savefig(os.path.join(save_dir, f"final_ll_distribution.png"))
 
     return best_model, best_ll
+
+
+
+if __name__ == "__main__":
+
+    fit_hmm(N=11, emissions=np.random.poisson(0.5, size=(1000, 50)), save_dir=r"C:\Users\srafi\OneDrive\NeuroStatsLab\sequence-detection-figures\test-hmm-fit", Niters=20, nStarts=5)
